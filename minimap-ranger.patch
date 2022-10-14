@@ -1,0 +1,1405 @@
+diff --git a/Makefile b/Makefile
+index 4118616..4f5c314 100644
+--- a/Makefile
++++ b/Makefile
+@@ -3,7 +3,7 @@ CPPFLAGS=	-DHAVE_KALLOC
+ INCLUDES=
+ OBJS=		kthread.o kalloc.o misc.o bseq.o sketch.o sdust.o options.o index.o \
+ 			lchain.o align.o hit.o seed.o map.o format.o pe.o esterr.o splitidx.o \
+-			ksw2_ll_sse.o
++			ksw2_ll_sse.o libranger_plugin_mm.o
+ PROG=		minimap2
+ PROG_EXTRA=	sdust minimap2-lite
+ LIBS=		-lm -lz -lpthread
+@@ -44,6 +44,10 @@ all:$(PROG)
+ 
+ extra:all $(PROG_EXTRA)
+ 
++ranger: all
++ranger: CPPFLAGS += -DHAVE_LIBRANGER
++ranger: LIBS += -lranger -Wl,-rpath,'$$ORIGIN/' -Wl,-z,origin
++
+ minimap2:main.o libminimap2.a
+ 		$(CC) $(CFLAGS) main.o -o $@ -L. -lminimap2 $(LIBS)
+ 
+@@ -124,6 +128,7 @@ main.o: bseq.h minimap.h mmpriv.h kseq.h ketopt.h
+ map.o: kthread.h kvec.h kalloc.h sdust.h mmpriv.h minimap.h bseq.h kseq.h
+ map.o: khash.h ksort.h
+ misc.o: mmpriv.h minimap.h bseq.h kseq.h ksort.h
++libranger_plugin_mm.o: libranger_plugin_mm.c libranger_plugin_mm.h minimap.h
+ options.o: mmpriv.h minimap.h bseq.h kseq.h
+ pe.o: mmpriv.h minimap.h bseq.h kseq.h kvec.h kalloc.h ksort.h
+ sdust.o: kalloc.h kdq.h kvec.h sdust.h
+diff --git a/index.c b/index.c
+index 0d8a2ae..3c99928 100644
+--- a/index.c
++++ b/index.c
+@@ -1,5 +1,6 @@
+ #include <stdlib.h>
+ #include <assert.h>
++#include <stdint.h>
+ #if defined(WIN32) || defined(_WIN32)
+ #include <io.h> // for open(2)
+ #else
+@@ -12,6 +13,7 @@
+ #include "bseq.h"
+ #include "minimap.h"
+ #include "mmpriv.h"
++#include "libranger_plugin_mm.h"
+ #include "kvec.h"
+ #include "khash.h"
+ 
+@@ -41,6 +43,17 @@ typedef struct mm_idx_intv_s {
+ 	mm_idx_intv1_t *a;
+ } mm_idx_intv_t;
+ 
++static inline int mm_flag_uses_libranger(int flag)
++{
++    return flag & MM_I_USENMPLUGIN;
++}
++
++int mm_idx_uses_libranger(const void *arg)
++{
++    const mm_idx_t *mi = (const mm_idx_t*)arg;
++    return mm_flag_uses_libranger(mi->flag);
++}
++
+ mm_idx_t *mm_idx_init(int w, int k, int b, int flag)
+ {
+ 	mm_idx_t *mi;
+@@ -48,7 +61,11 @@ mm_idx_t *mm_idx_init(int w, int k, int b, int flag)
+ 	if (w < 1) w = 1;
+ 	mi = (mm_idx_t*)calloc(1, sizeof(mm_idx_t));
+ 	mi->w = w, mi->k = k, mi->b = b, mi->flag = flag;
+-	mi->B = (mm_idx_bucket_t*)calloc(1<<b, sizeof(mm_idx_bucket_t));
++	if (mm_flag_uses_libranger(flag)) {
++	    mi->B = NULL;
++	} else {
++	    mi->B = (mm_idx_bucket_t*)calloc(1<<b, sizeof(mm_idx_bucket_t));
++	}
+ 	if (!(mm_dbg_flag & 1)) mi->km = km_init();
+ 	return mi;
+ }
+@@ -58,6 +75,10 @@ void mm_idx_destroy(mm_idx_t *mi)
+ 	uint32_t i;
+ 	if (mi == 0) return;
+ 	if (mi->h) kh_destroy(str, (khash_t(str)*)mi->h);
++	if (mm_idx_uses_libranger(mi)) {
++	    libranger_plugin_index_destroy((struct libranger *)mi->B);
++	    mi->B = NULL;
++	}
+ 	if (mi->B) {
+ 		for (i = 0; i < 1U<<mi->b; ++i) {
+ 			free(mi->B[i].p);
+@@ -78,6 +99,26 @@ void mm_idx_destroy(mm_idx_t *mi)
+ 	free(mi->B); free(mi->S); free(mi);
+ }
+ 
++/* Query four minimizers from "mi", returns four results, sets "n" to the
++ * occurrences of the four queries. */
++void
++mm_idx_get_batch(const mm_idx_t *mi,
++                 uint64_t *m,
++                 int *n,
++                 const uint64_t **v)
++{
++    PERF_START(perf_ns);
++    if (mm_idx_uses_libranger(mi)) {
++        libranger_plugin_index_query((struct libranger *)mi->B, m, n, v);
++    } else {
++        for (int i=0; i<LIBRANGER_BATCH_SIZE; i++) {
++            v[i] = mm_idx_get(mi, m[i], &n[i]);
++        }
++    }
++    PERF_END(perf_ns);
++    libranger_plugin_stats_add(QUERY, perf_ns / LIBRANGER_BATCH_SIZE);
++}
++
+ const uint64_t *mm_idx_get(const mm_idx_t *mi, uint64_t minier, int *n)
+ {
+ 	int mask = (1<<mi->b) - 1;
+@@ -97,6 +138,102 @@ const uint64_t *mm_idx_get(const mm_idx_t *mi, uint64_t minier, int *n)
+ 	}
+ }
+ 
++static int
++mm_idx_compare_aux(const int batch_size,
++                   const mm_idx_t *base,
++                   const mm_idx_t *mi,
++                   uint64_t *m)
++{
++    uint64_t *v1[LIBRANGER_BATCH_SIZE], *v2[LIBRANGER_BATCH_SIZE];
++    int n1[LIBRANGER_BATCH_SIZE], n2[LIBRANGER_BATCH_SIZE];
++    uint64_t x1, x2;
++    int j, l;
++    mm_idx_get_batch(base, m, n1, (const uint64_t **)v1);
++    mm_idx_get_batch(mi, m, n2, (const uint64_t **)v2);
++    for (j=0; j<batch_size; j++) {
++        l = -1;
++        if (n1[j] != n2[j]) {
++            goto error;
++        }
++        for (l=0; l<n1[j]; l++) {
++            x1 = v1[j][l];
++            x2 = v2[j][l];
++            if (x1 != x2) {
++                goto error;
++            }
++        }
++    }
++    return 0;
++error:
++    libranger_plugin_print("Index comparison error for seed %lu ", m[j]);
++    if (l == -1) {
++        libranger_plugin_print("base got %d values, second got %d values\n",
++               n1[j], n2[j]);
++    } else {
++        libranger_plugin_print("for value index %d, base got value %lu, "
++                "second value %lu\n",
++                l, x1, x2);
++    }
++    return 1;
++}
++
++void mm_idx_compare(const mm_idx_t *base, const mm_idx_t *mi)
++{
++    uint64_t m[LIBRANGER_BATCH_SIZE];
++    uint64_t key;
++    int idx;
++
++    if (mm_idx_uses_libranger(base)) {
++        libranger_plugin_print(
++                        "Cannot compare between the two index structures: "
++                        "The base index uses libranger.\n");
++        return;
++    } else if (!mm_idx_uses_libranger(mi)) {
++        libranger_plugin_print(
++                        "Cannot compare between the two index structures: "
++                        "The second index does not use libranger.\n");
++        return;
++    }
++
++    idx = 0;
++    for (int32_t i = 0; i < 1U<<base->b; ++i) {
++        idxhash_t *h = (idxhash_t*)base->B[i].h;
++        khint_t k;
++        if (h == 0) continue;
++        for (k = 0; k < kh_end(h); ++k) {
++            if (!kh_exist(h, k)) {
++                continue;
++            }
++            key = kh_key(h, k);
++            m[idx] = (key>>1<<base->b) | i;
++            idx++;
++            if (idx == LIBRANGER_BATCH_SIZE) {
++                if (mm_idx_compare_aux(LIBRANGER_BATCH_SIZE, base, mi, m)) {
++                    return;
++                }
++                idx = 0;
++            }
++        }
++    }
++    if (mm_idx_compare_aux(idx, base, mi, m)) {
++        return;
++    }
++
++    for (int i=0; i<10; i++) {
++        float element = 0.0001*i;
++        int x1 = mm_idx_cal_max_occ(base, element);
++        int x2 = mm_idx_cal_max_occ(mi, element);
++        if (x1 != x2) {
++            libranger_plugin_print(
++                    "Index comparison error: 'mm_idx_cal_max_occ'"
++                    "differ for %.5f (%d != %d)\n", element, x1, x2);
++            return;
++        }
++    }
++
++    libranger_plugin_print("Index comparison has passed successfully.\n");
++}
++
+ void mm_idx_stat(const mm_idx_t *mi)
+ {
+ 	int n = 0, n1 = 0;
+@@ -105,17 +242,25 @@ void mm_idx_stat(const mm_idx_t *mi)
+ 	fprintf(stderr, "[M::%s] kmer size: %d; skip: %d; is_hpc: %d; #seq: %d\n", __func__, mi->k, mi->w, mi->flag&MM_I_HPC, mi->n_seq);
+ 	for (i = 0; i < mi->n_seq; ++i)
+ 		len += mi->seq[i].len;
+-	for (i = 0; i < 1U<<mi->b; ++i)
+-		if (mi->B[i].h) n += kh_size((idxhash_t*)mi->B[i].h);
+-	for (i = 0; i < 1U<<mi->b; ++i) {
+-		idxhash_t *h = (idxhash_t*)mi->B[i].h;
+-		khint_t k;
+-		if (h == 0) continue;
+-		for (k = 0; k < kh_end(h); ++k)
+-			if (kh_exist(h, k)) {
+-				sum += kh_key(h, k)&1? 1 : (uint32_t)kh_val(h, k);
+-				if (kh_key(h, k)&1) ++n1;
+-			}
++	if (mm_idx_uses_libranger(mi)) {
++	    struct libranger_plugin_index_stats stats;
++	    libranger_plugin_index_get_stats((struct libranger *)mi->B, &stats);
++	    n = stats.distinct_seed_num;
++	    n1 = stats.singleton_num;
++	    sum = stats.total_seed_num;
++	} else {
++        for (i = 0; i < 1U<<mi->b; ++i)
++            if (mi->B[i].h) n += kh_size((idxhash_t*)mi->B[i].h);
++        for (i = 0; i < 1U<<mi->b; ++i) {
++            idxhash_t *h = (idxhash_t*)mi->B[i].h;
++            khint_t k;
++            if (h == 0) continue;
++            for (k = 0; k < kh_end(h); ++k)
++                if (kh_exist(h, k)) {
++                    sum += kh_key(h, k)&1? 1 : (uint32_t)kh_val(h, k);
++                    if (kh_key(h, k)&1) ++n1;
++                }
++        }
+ 	}
+ 	fprintf(stderr, "[M::%s::%.3f*%.2f] distinct minimizers: %d (%.2f%% are singletons); average occurrences: %.3lf; average spacing: %.3lf; total length: %ld\n",
+ 			__func__, realtime() - mm_realtime0, cputime() / (realtime() - mm_realtime0), n, 100.0*n1/n, (double)sum / n, (double)len / sum, (long)len);
+@@ -182,7 +327,9 @@ int mm_idx_getseq2(const mm_idx_t *mi, int is_rev, uint32_t rid, uint32_t st, ui
+ 	if (is_rev) return mm_idx_getseq_rev(mi, rid, st, en, seq);
+ 	else return mm_idx_getseq(mi, rid, st, en, seq);
+ }
+-
++static int cmpint(const void* a, const void *b){
++    return *(int*)a-*(int*)b;
++}
+ int32_t mm_idx_cal_max_occ(const mm_idx_t *mi, float f)
+ {
+ 	int i;
+@@ -190,19 +337,24 @@ int32_t mm_idx_cal_max_occ(const mm_idx_t *mi, float f)
+ 	uint32_t thres;
+ 	khint_t *a, k;
+ 	if (f <= 0.) return INT32_MAX;
+-	for (i = 0; i < 1<<mi->b; ++i)
+-		if (mi->B[i].h) n += kh_size((idxhash_t*)mi->B[i].h);
+-	a = (uint32_t*)malloc(n * 4);
+-	for (i = n = 0; i < 1<<mi->b; ++i) {
+-		idxhash_t *h = (idxhash_t*)mi->B[i].h;
+-		if (h == 0) continue;
+-		for (k = 0; k < kh_end(h); ++k) {
+-			if (!kh_exist(h, k)) continue;
+-			a[n++] = kh_key(h, k)&1? 1 : (uint32_t)kh_val(h, k);
+-		}
+-	}
+-	thres = ks_ksmall_uint32_t(n, a, (uint32_t)((1. - f) * n)) + 1;
+-	free(a);
++    if (mm_idx_uses_libranger(mi)) {
++        a = libranger_plugin_index_get_occurence_list((struct libranger *)mi->B, &n);
++    } else {
++        for (i = 0; i < 1<<mi->b; ++i)
++            if (mi->B[i].h) n += kh_size((idxhash_t*)mi->B[i].h);
++        a = (uint32_t*)malloc(n * 4);
++        for (i = n = 0; i < 1<<mi->b; ++i) {
++            idxhash_t *h = (idxhash_t*)mi->B[i].h;
++            if (h == 0) continue;
++            for (k = 0; k < kh_end(h); ++k) {
++                if (!kh_exist(h, k)) continue;
++                a[n++] = kh_key(h, k)&1? 1 : (uint32_t)kh_val(h, k);
++            }
++        }
++        qsort(a, n, sizeof(uint32_t), cmpint);
++    }
++    thres = ks_ksmall_uint32_t(n, a, (uint32_t)((1. - f) * n)) + 1;
++    free(a);
+ 	return thres;
+ }
+ 
+@@ -248,7 +400,7 @@ static void worker_post(void *g, long i, int tid)
+ 			} else {
+ 				int k;
+ 				for (k = 0; k < n; ++k)
+-					b->p[start_p + k] = b->a.a[start_a + k].y;
++				    b->p[start_p + k] = b->a.a[start_a + k].y;
+ 				radix_sort_64(&b->p[start_p], &b->p[start_p + n]); // sort by position; needed as in-place radix_sort_128x() is not stable
+ 				kh_val(h, itr) = (uint64_t)start_p<<32 | n;
+ 				start_p += n;
+@@ -263,7 +415,7 @@ static void worker_post(void *g, long i, int tid)
+ 	kfree(0, b->a.a);
+ 	b->a.n = b->a.m = 0, b->a.a = 0;
+ }
+- 
++
+ static void mm_idx_post(mm_idx_t *mi, int n_threads)
+ {
+ 	kt_for(n_threads, worker_post, mi, 1<<mi->b);
+@@ -290,9 +442,16 @@ typedef struct {
+ 	mm128_v a;
+ } step_t;
+ 
+-static void mm_idx_add(mm_idx_t *mi, int n, const mm128_t *a)
++static void mm_idx_add(mm_idx_t *mi, mm128_v *arr)
+ {
++    /* libranger collect seeds instead of feeding them to mm regular index */
++    if (mm_idx_uses_libranger(mi)) {
++        libranger_plugin_seeds_collect(arr);
++        return;
++    }
+ 	int i, mask = (1<<mi->b) - 1;
++	int n = arr->n;
++	const mm128_t *a = arr->a;
+ 	for (i = 0; i < n; ++i) {
+ 		mm128_v *p = &mi->B[a[i].x>>8&mask].a;
+ 		kv_push(mm128_t, 0, *p, a[i]);
+@@ -357,8 +516,9 @@ static void *worker_pipeline(void *shared, int step, void *in)
+         step_t *s = (step_t*)in;
+ 		for (i = 0; i < s->n_seq; ++i) {
+ 			mm_bseq1_t *t = &s->seq[i];
+-			if (t->l_seq > 0)
++			if (t->l_seq > 0) {
+ 				mm_sketch(0, t->seq, t->l_seq, p->mi->w, p->mi->k, t->rid, p->mi->flag&MM_I_HPC, &s->a);
++			}
+ 			else if (mm_verbose >= 2)
+ 				fprintf(stderr, "[WARNING] the length database sequence '%s' is 0\n", t->name);
+ 			free(t->seq); free(t->name);
+@@ -367,7 +527,7 @@ static void *worker_pipeline(void *shared, int step, void *in)
+ 		return s;
+     } else if (step == 2) { // dispatch sketch to buckets
+         step_t *s = (step_t*)in;
+-		mm_idx_add(p->mi, s->a.n, s->a.a);
++		mm_idx_add(p->mi, &s->a);
+ 		kfree(0, s->a.a); free(s);
+ 	}
+     return 0;
+@@ -387,10 +547,19 @@ mm_idx_t *mm_idx_gen(mm_bseq_file_t *fp, int w, int k, int b, int flag, int mini
+ 	if (mm_verbose >= 3)
+ 		fprintf(stderr, "[M::%s::%.3f*%.2f] collected minimizers\n", __func__, realtime() - mm_realtime0, cputime() / (realtime() - mm_realtime0));
+ 
+-	mm_idx_post(pl.mi, n_threads);
++	if (mm_flag_uses_libranger(flag)) {
++	    libranger_plugin_seeds_sort();
++	} else {
++	    mm_idx_post(pl.mi, n_threads);
++	}
+ 	if (mm_verbose >= 3)
+ 		fprintf(stderr, "[M::%s::%.3f*%.2f] sorted minimizers\n", __func__, realtime() - mm_realtime0, cputime() / (realtime() - mm_realtime0));
+ 
++	/* libranger plugin: create nm index within mi->B  */
++	if (mm_flag_uses_libranger(flag)) {
++	    pl.mi->B = (mm_idx_bucket_t*)libranger_plugin_index_init();
++	}
++
+ 	return pl.mi;
+ }
+ 
+@@ -447,7 +616,7 @@ mm_idx_t *mm_idx_str(int w, int k, int is_hpc, int bucket_bits, int n, const cha
+ 		if (p->len > 0) {
+ 			a.n = 0;
+ 			mm_sketch(0, s, p->len, w, k, i, is_hpc, &a);
+-			mm_idx_add(mi, a.n, a.a);
++			mm_idx_add(mi, &a);
+ 		}
+ 	}
+ 	free(a.a);
+@@ -459,6 +628,44 @@ mm_idx_t *mm_idx_str(int w, int k, int is_hpc, int bucket_bits, int n, const cha
+  * index I/O *
+  *************/
+ 
++mm_idx_size_t mm_idx_calc_size_bytes(const mm_idx_t *mi)
++{
++    mm_idx_size_t out;
++    uint32_t i;
++    uint32_t hash_flag_size;
++    uint64_t sum_len;
++
++    memset(&out, 0, sizeof(out));
++    if (mm_idx_uses_libranger(mi)) {
++        out = libranger_plugin_index_get_size((struct libranger *)mi->B);
++    } else {
++        out.index += (1<<mi->b) * sizeof(struct mm_idx_bucket_s);
++        for (i = 0; i < 1<<mi->b; ++i) {
++            mm_idx_bucket_t *b = &mi->B[i];
++            idxhash_t *h = (idxhash_t*)b->h;
++            out.poslist += sizeof(uint64_t) * b->n; /* B->p */
++            out.index += sizeof(idxhash_t);         /* B->h */
++            if (!h) {
++                continue;
++            }
++            /* Add hash memory */
++            hash_flag_size = h->n_buckets < 16 ? 1 : h->n_buckets >> 4;
++            out.index += hash_flag_size * sizeof(khint32_t);/* B->h->flags */
++            out.index += h->n_buckets * sizeof(uint64_t); /* B->h->keys */
++            out.index += h->n_buckets * sizeof(uint64_t); /* B->h->vals */
++        }
++    }
++
++    sum_len = 0;
++    for (i = 0; i < mi->n_seq; ++i) {
++        out.ref += strlen(mi->seq[i].name) + 1;
++        sum_len += mi->seq[i].len;
++    }
++    out.ref += sizeof(uint32_t) * (sum_len + 7) / 8;
++
++    return out;
++}
++
+ void mm_idx_dump(FILE *fp, const mm_idx_t *mi)
+ {
+ 	uint64_t sum_len = 0;
+@@ -479,22 +686,29 @@ void mm_idx_dump(FILE *fp, const mm_idx_t *mi)
+ 		fwrite(&mi->seq[i].len, 4, 1, fp);
+ 		sum_len += mi->seq[i].len;
+ 	}
+-	for (i = 0; i < 1<<mi->b; ++i) {
+-		mm_idx_bucket_t *b = &mi->B[i];
+-		khint_t k;
+-		idxhash_t *h = (idxhash_t*)b->h;
+-		uint32_t size = h? h->size : 0;
+-		fwrite(&b->n, 4, 1, fp);
+-		fwrite(b->p, 8, b->n, fp);
+-		fwrite(&size, 4, 1, fp);
+-		if (size == 0) continue;
+-		for (k = 0; k < kh_end(h); ++k) {
+-			uint64_t x[2];
+-			if (!kh_exist(h, k)) continue;
+-			x[0] = kh_key(h, k), x[1] = kh_val(h, k);
+-			fwrite(x, 8, 2, fp);
+-		}
++
++	/* libranger plugin: write custom index */
++	if (mm_idx_uses_libranger(mi)) {
++	    libranger_plugin_index_save((struct libranger *)mi->B, fp);
++	} else {
++        for (i = 0; i < 1<<mi->b; ++i) {
++            mm_idx_bucket_t *b = &mi->B[i];
++            khint_t k;
++            idxhash_t *h = (idxhash_t*)b->h;
++            uint32_t size = h? h->size : 0;
++            fwrite(&b->n, 4, 1, fp);
++            fwrite(b->p, 8, b->n, fp);
++            fwrite(&size, 4, 1, fp);
++            if (size == 0) continue;
++            for (k = 0; k < kh_end(h); ++k) {
++                uint64_t x[2];
++                if (!kh_exist(h, k)) continue;
++                x[0] = kh_key(h, k), x[1] = kh_val(h, k);
++                fwrite(x, 8, 2, fp);
++            }
++        }
+ 	}
++
+ 	if (!(mi->flag & MM_I_NO_SEQ))
+ 		fwrite(mi->S, 4, (sum_len + 7) / 8, fp);
+ 	fflush(fp);
+@@ -527,27 +741,51 @@ mm_idx_t *mm_idx_load(FILE *fp)
+ 		s->is_alt = 0;
+ 		sum_len += s->len;
+ 	}
+-	for (i = 0; i < 1<<mi->b; ++i) {
+-		mm_idx_bucket_t *b = &mi->B[i];
+-		uint32_t j, size;
+-		khint_t k;
+-		idxhash_t *h;
+-		fread(&b->n, 4, 1, fp);
+-		b->p = (uint64_t*)malloc(b->n * 8);
+-		fread(b->p, 8, b->n, fp);
+-		fread(&size, 4, 1, fp);
+-		if (size == 0) continue;
+-		b->h = h = kh_init(idx);
+-		kh_resize(idx, h, size);
+-		for (j = 0; j < size; ++j) {
+-			uint64_t x[2];
+-			int absent;
+-			fread(x, 8, 2, fp);
+-			k = kh_put(idx, h, x[0], &absent);
+-			assert(absent);
+-			kh_val(h, k) = x[1];
+-		}
+-	}
++
++    /* libranger plugin: load custom index */
++    if (mm_idx_uses_libranger(mi)) {
++        mi->B = (mm_idx_bucket_t*)libranger_plugin_index_load(fp);
++        struct libranger_plugin_index_stats stats;
++        libranger_plugin_index_get_stats((struct libranger *)mi->B, &stats);
++        libranger_plugin_print("ranger index stats: "
++                               "total bytes: %lu appendix bytes: %lu "
++                               "redundant bytes: %lu "
++                               "used bytes: %lu distinct records: %lu "
++                               "singletons: %lu total records: %lu "
++                               "bucket prefix: %.2lf +- %.2lf bits \n",
++                               stats.total_bytes,
++                               stats.appendix_bytes,
++                               stats.redundant_bytes,
++                               stats.used_bytes,
++                               stats.distinct_seed_num,
++                               stats.singleton_num,
++                               stats.total_seed_num,
++                               stats.prefix_bits_mean,
++                               stats.prefix_bits_stddev);
++    } else {
++        for (i = 0; i < 1<<mi->b; ++i) {
++            mm_idx_bucket_t *b = &mi->B[i];
++            uint32_t j, size;
++            khint_t k;
++            idxhash_t *h;
++            fread(&b->n, 4, 1, fp);
++            b->p = (uint64_t*)malloc(b->n * 8);
++            fread(b->p, 8, b->n, fp);
++            fread(&size, 4, 1, fp);
++            if (size == 0) continue;
++            b->h = h = kh_init(idx);
++            kh_resize(idx, h, size);
++            for (j = 0; j < size; ++j) {
++                uint64_t x[2];
++                int absent;
++                fread(x, 8, 2, fp);
++                k = kh_put(idx, h, x[0], &absent);
++                assert(absent);
++                kh_val(h, k) = x[1];
++            }
++        }
++    }
++
+ 	if (!(mi->flag & MM_I_NO_SEQ)) {
+ 		mi->S = (uint32_t*)malloc((sum_len + 7) / 8 * 4);
+ 		fread(mi->S, 4, (sum_len + 7) / 8, fp);
+@@ -612,8 +850,9 @@ mm_idx_t *mm_idx_reader_read(mm_idx_reader_t *r, int n_threads)
+ 		mi = mm_idx_load(r->fp.idx);
+ 		if (mi && mm_verbose >= 2 && (mi->k != r->opt.k || mi->w != r->opt.w || (mi->flag&MM_I_HPC) != (r->opt.flag&MM_I_HPC)))
+ 			fprintf(stderr, "[WARNING]\033[1;31m Indexing parameters (-k, -w or -H) overridden by parameters used in the prebuilt index.\033[0m\n");
+-	} else
++	} else {
+ 		mi = mm_idx_gen(r->fp.seq, r->opt.w, r->opt.k, r->opt.bucket_bits, r->opt.flag, r->opt.mini_batch_size, n_threads, r->opt.batch_size);
++	}
+ 	if (mi) {
+ 		if (r->fp_out) mm_idx_dump(r->fp_out, mi);
+ 		mi->index = r->n_parts++;
+@@ -665,7 +904,6 @@ mm_idx_intv_t *mm_idx_read_bed(const mm_idx_t *mi, const char *fn, int read_junc
+ 	kstream_t *ks;
+ 	kstring_t str = {0,0,0};
+ 	mm_idx_intv_t *I;
+-
+ 	fp = fn && strcmp(fn, "-")? gzopen(fn, "r") : gzdopen(fileno(stdin), "r");
+ 	if (fp == 0) return 0;
+ 	I = (mm_idx_intv_t*)calloc(mi->n_seq, sizeof(*I));
+diff --git a/lchain.c b/lchain.c
+index a1615ac..5e8578d 100644
+--- a/lchain.c
++++ b/lchain.c
+@@ -5,6 +5,7 @@
+ #include "mmpriv.h"
+ #include "kalloc.h"
+ #include "krmq.h"
++#include "libranger_plugin_mm.h"
+ 
+ uint64_t *mg_chain_backtrack(void *km, int64_t n, const int32_t *f, const int64_t *p, int32_t *v, int32_t *t, int32_t min_cnt, int32_t min_sc, int32_t *n_u_, int32_t *n_v_)
+ {
+@@ -127,11 +128,12 @@ mm128_t *mg_lchain_dp(int max_dist_x, int max_dist_y, int bw, int max_skip, int
+ 	int32_t *f, *t, *v, n_u, n_v, mmax_f = 0;
+ 	int64_t *p, i, j, max_ii, st = 0, n_iter = 0;
+ 	uint64_t *u;
++	mm128_t *result = 0;
+ 
+ 	if (_u) *_u = 0, *n_u_ = 0;
+ 	if (n == 0 || a == 0) {
+ 		kfree(km, a);
+-		return 0;
++		goto exit;
+ 	}
+ 	if (max_dist_x < bw) max_dist_x = bw;
+ 	if (max_dist_y < bw && !is_cdna) max_dist_y = bw;
+@@ -186,9 +188,11 @@ mm128_t *mg_lchain_dp(int max_dist_x, int max_dist_y, int bw, int max_skip, int
+ 	kfree(km, p); kfree(km, f); kfree(km, t);
+ 	if (n_u == 0) {
+ 		kfree(km, a); kfree(km, v);
+-		return 0;
++		goto exit;
+ 	}
+-	return compact_a(km, n_u, u, n_v, v, a);
++	result=compact_a(km, n_u, u, n_v, v, a);
++exit:
++    return result;
+ }
+ 
+ typedef struct lc_elem_s {
+diff --git a/libranger_plugin_mm.c b/libranger_plugin_mm.c
+new file mode 100644
+index 0000000..95f0183
+--- /dev/null
++++ b/libranger_plugin_mm.c
+@@ -0,0 +1,379 @@
++#include <stdlib.h>
++#include <stdio.h>
++#include <string.h>
++#include <math.h>
++#include "minimap.h"
++#include "khash.h"
++#include "kvec.h"
++#ifdef HAVE_LIBRANGER
++# include "libranger.h"
++#endif
++#include "libranger_plugin_mm.h"
++
++struct seed {
++    uint64_t key;
++    uint64_t value;
++};
++
++struct stats {
++    double counter;
++    double total;
++};
++
++struct stats stats[4];
++
++/* Define k-mer array type */
++typedef kvec_t(struct seed) seed_vector_t;
++
++/* How many threads to work with */
++static int nthreads = 1;
++
++/* Output filenames */
++static FILE *seed_out = NULL;
++static FILE *range_out = NULL;
++
++/* For collecting seeds */
++static seed_vector_t seed_array;
++static int seed_array_initialized = 0;
++
++/* Compare between two indices */
++static mm_idx_t *comparison_idx = NULL;
++
++void
++libranger_plugin_print(const char *fmt, ...)
++{
++    va_list lst;
++    fprintf(stderr,
++            "[M::%s::%.3f*%.2f] ",
++            "libranger-plugin",
++            realtime() - mm_realtime0,
++            cputime() / (realtime() - mm_realtime0));
++    va_start(lst, fmt);
++    vfprintf(stderr, fmt, lst);
++    va_end(lst);
++}
++
++void
++libranger_plugin_set_seeds_out(const char *filename)
++{
++    seed_out=fopen(filename, "wb");
++}
++
++void
++libranger_plugin_set_range_out(const char *filename)
++{
++    range_out=fopen(filename, "wb");
++}
++
++void libranger_plugin_set_nthreads(int n)
++{
++    nthreads = n;
++}
++
++static int
++seed_compare(const void *a, const void *b)
++{
++    struct seed *ka = (struct seed*)a;
++    struct seed *kb = (struct seed*)b;
++    return ka->key > kb->key ? 1 : ka->key < kb->key ? -1 :
++           ka->value > kb->value ? 1 : -1;
++}
++
++static inline void
++initialize_seed_array()
++{
++    if (seed_array_initialized) {
++        return;
++    }
++    seed_array_initialized = 1;
++    kv_init(seed_array);
++}
++
++void
++libranger_plugin_seeds_collect(mm128_v *a)
++{
++    seed_vector_t array;
++    uint64_t size;
++    struct seed element;
++
++    initialize_seed_array();
++
++    /* Concatenate the current seed vector to the general seed vector */
++    array = *(seed_vector_t *)a;
++    size = kv_size(array);
++
++    libranger_plugin_print("collected %lu seeds in batch \n", size);
++
++    for (size_t i=0; i<size; ++i) {
++        /* Remove the 8 LSBs from the seeds, similar to what is done in
++         * the hash-table indexing. */
++        element = kv_A(array, i);
++        element.key >>= 8;
++        kv_push(struct seed, NULL, seed_array, element);
++    }
++}
++
++void
++libranger_plugin_seeds_sort()
++{
++    uint64_t size;
++    initialize_seed_array();
++    size = kv_size(seed_array);
++    libranger_plugin_print("collected total %lu seeds, sorting...\n", size);
++    qsort(seed_array.a, size, sizeof(struct seed), seed_compare);
++}
++
++void
++libranger_plugin_seeds_dump()
++{
++    uint64_t size;
++    uint64_t last;
++    uint64_t count;
++
++    if (!seed_out) {
++        return;
++    }
++
++    libranger_plugin_print("dumping seeds to file\n");
++
++    /* Write the number of seeds */
++    size = kv_size(seed_array);
++    fwrite(&size, sizeof(uint64_t), 1, seed_out);
++
++    last = 0;
++    count = 0;
++
++    for (size_t i=0; i<size; ++i) {
++        if (kv_A(seed_array, i).key != last) {
++            count++;
++            last = kv_A(seed_array, i).key;
++        }
++        fwrite(&kv_A(seed_array, i), sizeof(struct seed), 1, seed_out);
++    }
++
++    libranger_plugin_print("counted %lu distinct seeds\n", count);
++}
++
++int
++libranger_plugin_extract_ranges(const mm_idx_t *mi)
++{
++#ifndef HAVE_LIBRANGER
++    return 1;
++#else
++    struct libranger * ranger;
++    const uint64_t *ranges;
++    size_t num;
++
++    if (!mm_idx_uses_libranger(mi) || !range_out) {
++        return 1;
++    }
++
++    libranger_plugin_print("extracting ranges from index...\n");
++    ranger = (struct libranger *)mi->B;
++    libranger_extrat_ranges(ranger, &ranges, &num);
++    for (size_t i=0; i<num; ++i) {
++        fprintf(range_out, "%lu\n", ranges[i]);
++    }
++    fclose(range_out);
++    return 0;
++#endif
++}
++
++#ifdef HAVE_LIBRANGER
++static int
++get_next_seed(uint64_t *key, uint64_t *value, void *args)
++{
++    struct seed *seed;
++    int *idx = (int*)args;
++    if (*idx >= kv_size(seed_array)) {
++        return 1;
++    }
++    seed = (struct seed*)&kv_A(seed_array, *idx);
++    *key = seed->key;
++    *value = seed->value;
++    (*idx)++;
++    return 0;
++}
++#endif
++
++struct libranger *
++libranger_plugin_index_init()
++{
++#ifndef HAVE_LIBRANGER
++    return NULL;
++#else
++    struct libranger *ranger;
++    uint64_t size;
++    int index;
++
++    index = 0;
++    size = kv_size(seed_array);
++    ranger = libranger_init(stderr);
++    libranger_plugin_print("building ranger index...\n");
++    PERF_START(time);
++    libranger_build(ranger, size, true, 16, get_next_seed, &index);
++    PERF_END(time);
++    libranger_plugin_print("total index build time: %.3lf msec\n", time/1e6);
++    return ranger;
++#endif
++}
++
++void
++libranger_plugin_index_destroy(struct libranger *idx)
++{
++#ifndef HAVE_LIBRANGER
++    return;
++#else
++    libranger_destroy(idx);
++#endif
++}
++
++void
++libranger_plugin_index_save(struct libranger *idx, FILE *fp)
++{
++#ifndef HAVE_LIBRANGER
++    return;
++#else
++    libranger_save(idx, fp);
++#endif
++}
++
++struct libranger *
++libranger_plugin_index_load(FILE *fp)
++{
++#ifndef HAVE_LIBRANGER
++    return NULL;
++#else
++    return libranger_load(fp);
++#endif
++}
++
++mm_idx_size_t
++libranger_plugin_index_get_size(struct libranger *idx)
++{
++    mm_idx_size_t out;
++    memset(&out, 0, sizeof(out));
++#ifdef HAVE_LIBRANGER
++    out.poslist = libranger_get_appendix_size(idx);
++    out.index = idx->size - out.poslist;
++#endif
++    return out;
++}
++
++void
++libranger_plugin_index_get_stats(struct libranger *idx,
++                                 struct libranger_plugin_index_stats * stats)
++{
++#ifndef HAVE_LIBRANGER
++    return;
++#else
++    libranger_get_stats(idx);
++    memcpy(stats, &idx->total_bytes, sizeof(*stats));
++#endif
++}
++
++uint32_t*
++libranger_plugin_index_get_occurence_list(struct libranger *idx, size_t *count)
++{
++#ifndef HAVE_LIBRANGER
++    return 0;
++#else
++    return libranger_get_occ_list(idx, count);
++#endif
++}
++
++void
++libranger_plugin_index_query(struct libranger *idx,
++                             uint64_t *keys,
++                             int *num,
++                             const uint64_t **ptr)
++{
++#ifndef HAVE_LIBRANGER
++    return;
++#else
++    libranger_query(idx, keys, num, (char**)ptr);
++#endif
++}
++
++void
++libranger_plugin_index_query_perf(struct libranger *idx,
++                                  uint64_t *keys,
++                                  int *num,
++                                  const uint64_t **ptr)
++{
++#ifndef HAVE_LIBRANGER
++    return;
++#else
++    libranger_query_perf(idx, keys, num, (char**)ptr);
++#endif
++}
++
++
++void
++libranger_plugin_index_print_perf_string(const mm_idx_t *mi)
++{
++#ifndef HAVE_LIBRANGER
++    return;
++#else
++    if (!mm_idx_uses_libranger(mi)) {
++        return;
++    }
++    struct libranger * lnmidx;
++    lnmidx = (struct libranger*)mi->B;
++    char *msg = libranger_get_perf_string(lnmidx);
++    libranger_plugin_print("libranger performance statistics: %s\n", msg);
++    free(msg);
++#endif
++}
++
++void
++libranger_plugin_index_comparison_init(const char *index_filename)
++{
++    mm_idx_reader_t *idx_rdr;
++    idx_rdr = mm_idx_reader_open(index_filename, NULL, NULL);
++    comparison_idx = mm_idx_reader_read(idx_rdr, nthreads);
++}
++
++void
++libranger_plugin_index_comparison_do(const mm_idx_t *base_index)
++{
++    if (!comparison_idx) {
++        return;
++    }
++    mm_idx_compare(base_index, comparison_idx);
++}
++
++void
++libranger_plugin_stats_init()
++{
++    memset(stats, 0, sizeof(stats));
++}
++
++void
++libranger_plugin_stats_add(enum stats_type type, double value)
++{
++    stats[(int)type].counter++;
++    stats[(int)type].total += value;
++}
++
++static inline void
++libranger_plugin_stats_print_element(enum stats_type type,
++                                     const char *name)
++{
++    libranger_plugin_print("statistics for %s: total time %.6lf msec "
++                           "counter: %.0lf avg. %.3lf usec\n",
++                           name,
++                           stats[(int)type].total / 1e6,
++                           stats[(int)type].counter,
++                           stats[(int)type].total / stats[(int)type].counter /
++                           1e3);
++}
++
++void
++libranger_plugin_stats_print()
++{
++    libranger_plugin_stats_print_element(COLLECT, "collect");
++    libranger_plugin_stats_print_element(QUERY, "query");
++    libranger_plugin_stats_print_element(CHAIN, "chain");
++    libranger_plugin_stats_print_element(POST, "post");
++}
+diff --git a/libranger_plugin_mm.h b/libranger_plugin_mm.h
+new file mode 100644
+index 0000000..1f0ce90
+--- /dev/null
++++ b/libranger_plugin_mm.h
+@@ -0,0 +1,103 @@
++#ifndef NMPLUGIN_H
++#define NMPLUGIN_H
++
++#include <stdarg.h>
++#include <stdint.h>
++#include <time.h>
++#include "libranger_plugin_mm.h"
++#include "mmpriv.h"
++
++#define TIMESPAN_GET_NS(DEST, START, END)          \
++        DEST=-(START.tv_sec * 1e9 + START.tv_nsec) \
++             +(END.tv_sec * 1e9 + END.tv_nsec);
++
++#define TIMESPAN_MEASURE(NAME) \
++        clock_gettime(CLOCK_MONOTONIC, &NAME);
++
++/**
++ * Start measuring time (nanosec) to variable "name"
++ */
++#define PERF_START(name)                      \
++    struct timespec name##_start, name##_end; \
++    double name;                              \
++    TIMESPAN_MEASURE(name##_start);
++
++/**
++ * Stop measuring time, store results to variable double "name"
++ */
++#define PERF_END(name)                              \
++    TIMESPAN_MEASURE(name##_end);                   \
++    TIMESPAN_GET_NS(name, name##_start, name##_end) \
++
++#define LIBRANGER_BATCH_SIZE 32
++
++enum stats_type {
++    COLLECT = 0,
++    QUERY = 1,
++    CHAIN = 2,
++    POST = 3
++};
++
++struct libranger;
++
++struct libranger_plugin_index_stats {
++    size_t total_bytes;
++    size_t appendix_bytes;
++    size_t redundant_bytes;
++    size_t distinct_seed_num;
++    size_t used_bytes;
++    size_t singleton_num;
++    size_t total_seed_num;
++    double prefix_bits_mean;
++    double prefix_bits_stddev;
++};
++
++/* Print message to log using Minimap2 default format */
++void libranger_plugin_print(const char *fmt, ...);
++
++/* Extract ranges from "mi". Returns 0 on success */
++int libranger_plugin_extract_ranges(const mm_idx_t *mi);
++
++/* Get arguments from user */
++void libranger_plugin_set_seeds_out(const char *filename);
++void libranger_plugin_set_range_out(const char *filename);
++void libranger_plugin_set_nthreads(int nthreads);
++
++void libranger_plugin_seeds_dump();
++void libranger_plugin_seeds_collect(mm128_v *array);
++void libranger_plugin_seeds_sort();
++
++struct libranger * libranger_plugin_index_init();
++void libranger_plugin_index_destroy(struct libranger *idx);
++
++void libranger_plugin_index_save(struct libranger *idx, FILE *fp);
++struct libranger *libranger_plugin_index_load(FILE *fp);
++
++mm_idx_size_t libranger_plugin_index_get_size(struct libranger *idx);
++void libranger_plugin_index_get_stats(struct libranger *idx,
++                                      struct libranger_plugin_index_stats *);
++uint32_t* libranger_plugin_index_get_occurence_list(struct libranger *idx,
++                                                    size_t *count);
++
++/* Query ranger index. Do not collect statistics (faster) */
++void libranger_plugin_index_query(struct libranger *idx,
++                                  uint64_t *keys,
++                                  int *num,
++                                  const uint64_t **ptr);
++
++/* Query ranger index. Collect statistics (slower) */
++void libranger_plugin_index_query_perf(struct libranger *idx,
++                                       uint64_t *keys,
++                                       int *num,
++                                       const uint64_t **ptr);
++
++void libranger_plugin_index_print_perf_string(const mm_idx_t *mi);
++
++void libranger_plugin_index_comparison_init(const char *index_filename);
++void libranger_plugin_index_comparison_do(const mm_idx_t *base_index);
++
++void libranger_plugin_stats_init();
++void libranger_plugin_stats_add(enum stats_type type, double value);
++void libranger_plugin_stats_print();
++
++#endif
+diff --git a/main.c b/main.c
+index 84d3129..dffec82 100644
+--- a/main.c
++++ b/main.c
+@@ -6,6 +6,7 @@
+ #include "minimap.h"
+ #include "mmpriv.h"
+ #include "ketopt.h"
++#include "libranger_plugin_mm.h"
+ 
+ #define MM_VERSION "2.22-r1105-dirty"
+ 
+@@ -83,6 +84,11 @@ static ko_longopt_t long_options[] = {
+ 	{ "mask-level",     ko_required_argument, 'M' },
+ 	{ "min-dp-score",   ko_required_argument, 's' },
+ 	{ "sam",            ko_no_argument,       'a' },
++	// libranger plugin specific options
++	{ "libranger-dump-seeds",   ko_required_argument, 901 },
++	{ "libranger-dump-ranges",  ko_required_argument, 902 },
++	{ "libranger-create-index", ko_no_argument,       903 },
++	{ "libranger-compare-index",ko_required_argument, 904 },
+ 	{ 0, 0, 0 }
+ };
+ 
+@@ -295,6 +301,11 @@ int main(int argc, char *argv[])
+ 			opt.e = opt.e2 = strtol(o.arg, &s, 10);
+ 			if (*s == ',') opt.e2 = strtol(s + 1, &s, 10);
+ 		}
++        // libranger plugin specific options
++        else if (c == 901) libranger_plugin_set_seeds_out(o.arg); // --libranger-dump-seeds
++        else if (c == 902) libranger_plugin_set_range_out(o.arg); // --libranger-dump-ranges
++        else if (c == 903) ipt.flag |= MM_I_USENMPLUGIN; // --libranger-create-index
++        else if (c == 904) libranger_plugin_index_comparison_init(o.arg); // --libranger-comapre-index
+ 	}
+ 	if ((opt.flag & MM_F_SPLICE) && (opt.flag & MM_F_FRAG_MODE)) {
+ 		fprintf(stderr, "[ERROR]\033[1;31m --splice and --frag should not be specified at the same time.\033[0m\n");
+@@ -380,8 +391,26 @@ int main(int argc, char *argv[])
+ 	}
+ 	if (opt.best_n == 0 && (opt.flag&MM_F_CIGAR) && mm_verbose >= 2)
+ 		fprintf(stderr, "[WARNING]\033[1;31m `-N 0' reduces alignment accuracy. Please use --secondary=no to suppress secondary alignments.\033[0m\n");
++
++	// initiate libranger
++	libranger_plugin_set_nthreads(n_threads);
++	libranger_plugin_stats_init();
++
+ 	while ((mi = mm_idx_reader_read(idx_rdr, n_threads)) != 0) {
+ 		int ret;
++		// print index size breakdown
++        mm_idx_size_t idx_size = mm_idx_calc_size_bytes(mi);
++        libranger_plugin_print("Index size: index %.3lf MB poslist: %.3lf MB "
++                               "refstring: %.3lf MB\n",
++                               idx_size.index/1024.0/1024.0,
++                               idx_size.poslist/1024.0/1024.0,
++                               idx_size.ref/1024.0/1024.0);
++		// do libranger plugin operations
++		libranger_plugin_index_comparison_do(mi);
++		if (!libranger_plugin_extract_ranges(mi)) {
++		    break;
++		}
++
+ 		if ((opt.flag & MM_F_CIGAR) && (mi->flag & MM_I_NO_SEQ)) {
+ 			fprintf(stderr, "[ERROR] the prebuilt index doesn't contain sequences.\n");
+ 			mm_idx_destroy(mi);
+@@ -408,6 +437,7 @@ int main(int argc, char *argv[])
+ 		if (mm_verbose >= 3)
+ 			fprintf(stderr, "[M::%s::%.3f*%.2f] loaded/built the index for %d target sequence(s)\n",
+ 					__func__, realtime() - mm_realtime0, cputime() / (realtime() - mm_realtime0), mi->n_seq);
++		PERF_START(perf_ns);
+ 		if (argc != o.ind + 1) mm_mapopt_update(&opt, mi);
+ 		if (mm_verbose >= 3) mm_idx_stat(mi);
+ 		if (junc_bed) mm_idx_bed_read(mi, junc_bed, 1);
+@@ -425,6 +455,10 @@ int main(int argc, char *argv[])
+ 		} else {
+ 			ret = mm_map_file_frag(mi, argc - (o.ind + 1), (const char**)&argv[o.ind + 1], &opt, n_threads);
+ 		}
++		PERF_END(perf_ns);
++		libranger_plugin_print("Total seconds: %.6lf\n", perf_ns/1e9);
++		// print performance stats for libranger
++		libranger_plugin_index_print_perf_string(mi);
+ 		mm_idx_destroy(mi);
+ 		if (ret < 0) {
+ 			fprintf(stderr, "ERROR: failed to map the query file\n");
+@@ -434,6 +468,9 @@ int main(int argc, char *argv[])
+ 	n_parts = idx_rdr->n_parts;
+ 	mm_idx_reader_close(idx_rdr);
+ 
++	// libranger plugin dump operations
++	libranger_plugin_seeds_dump();
++
+ 	if (opt.split_prefix)
+ 		mm_split_merge(argc - (o.ind + 1), (const char**)&argv[o.ind + 1], &opt, n_parts);
+ 
+@@ -449,5 +486,7 @@ int main(int argc, char *argv[])
+ 			fprintf(stderr, " %s", argv[i]);
+ 		fprintf(stderr, "\n[M::%s] Real time: %.3f sec; CPU: %.3f sec; Peak RSS: %.3f GB\n", __func__, realtime() - mm_realtime0, cputime(), peakrss() / 1024.0 / 1024.0 / 1024.0);
+ 	}
++	// print libranger collected statistics for Minimap2
++	libranger_plugin_stats_print();
+ 	return 0;
+ }
+diff --git a/map.c b/map.c
+index 7da9a49..2b8ecbd 100644
+--- a/map.c
++++ b/map.c
+@@ -9,6 +9,7 @@
+ #include "mmpriv.h"
+ #include "bseq.h"
+ #include "khash.h"
++#include "libranger_plugin_mm.h"
+ 
+ struct mm_tbuf_s {
+ 	void *km;
+@@ -188,14 +189,14 @@ static mm128_t *collect_seed_hits(void *km, const mm_mapopt_t *opt, int max_occ,
+ 			if (skip_seed(opt->flag, r[k], q, qname, qlen, mi, &is_self)) continue;
+ 			p = &a[(*n_a)++];
+ 			if ((r[k]&1) == (q->q_pos&1)) { // forward strand
+-				p->x = (r[k]&0xffffffff00000000ULL) | rpos;
++			    p->x = (r[k]&0xffffffff00000000ULL) | rpos;
+ 				p->y = (uint64_t)q->q_span << 32 | q->q_pos >> 1;
+ 			} else if (!(opt->flag & MM_F_QSTRAND)) { // reverse strand and not in the query-strand mode
+ 				p->x = 1ULL<<63 | (r[k]&0xffffffff00000000ULL) | rpos;
+ 				p->y = (uint64_t)q->q_span << 32 | (qlen - ((q->q_pos>>1) + 1 - q->q_span) - 1);
+ 			} else { // reverse strand; query-strand
+-				int32_t len = mi->seq[r[k]>>32].len;
+-				p->x = 1ULL<<63 | (r[k]&0xffffffff00000000ULL) | (len - (rpos + 1 - q->q_span) - 1); // coordinate only accurate for non-HPC seeds
++			    int32_t len = mi->seq[r[k]>>32].len;
++			    p->x = 1ULL<<63 | (r[k]&0xffffffff00000000ULL) | (len - (rpos + 1 - q->q_span) - 1); // coordinate only accurate for non-HPC seeds
+ 				p->y = (uint64_t)q->q_span << 32 | q->q_pos >> 1;
+ 			}
+ 			p->y |= (uint64_t)q->seg_id << MM_SEED_SEG_SHIFT;
+@@ -251,10 +252,13 @@ void mm_map_frag(const mm_idx_t *mi, int n_segs, const int *qlens, const char **
+ 	hash ^= __ac_Wang_hash(qlen_sum) + __ac_Wang_hash(opt->seed);
+ 	hash  = __ac_Wang_hash(hash);
+ 
++	PERF_START(collect_ns);
+ 	collect_minimizers(b->km, opt, mi, n_segs, qlens, seqs, &mv);
+ 	if (opt->q_occ_frac > 0.0f) mm_seed_mz_flt(b->km, &mv, opt->mid_occ, opt->q_occ_frac);
+ 	if (opt->flag & MM_F_HEAP_SORT) a = collect_seed_hits_heap(b->km, opt, opt->mid_occ, mi, qname, &mv, qlen_sum, &n_a, &rep_len, &n_mini_pos, &mini_pos);
+ 	else a = collect_seed_hits(b->km, opt, opt->mid_occ, mi, qname, &mv, qlen_sum, &n_a, &rep_len, &n_mini_pos, &mini_pos);
++    PERF_END(collect_ns);
++    libranger_plugin_stats_add(COLLECT, collect_ns);
+ 
+ 	if (mm_dbg_flag & MM_DBG_PRINT_SEED) {
+ 		fprintf(stderr, "RS\t%d\n", rep_len);
+@@ -263,6 +267,7 @@ void mm_map_frag(const mm_idx_t *mi, int n_segs, const int *qlens, const char **
+ 					i == 0? 0 : ((int32_t)a[i].y - (int32_t)a[i-1].y) - ((int32_t)a[i].x - (int32_t)a[i-1].x));
+ 	}
+ 
++    PERF_START(chain_ns);
+ 	// set max chaining gap on the query and the reference sequence
+ 	if (is_sr)
+ 		max_chain_gap_qry = qlen_sum > opt->max_gap? qlen_sum : opt->max_gap;
+@@ -324,6 +329,8 @@ void mm_map_frag(const mm_idx_t *mi, int n_segs, const int *qlens, const char **
+ 		mm_mark_alt(mi, n_regs0, regs0);
+ 		mm_hit_sort(b->km, &n_regs0, regs0, opt->alt_drop); // this step can be merged into mm_gen_regs(); will do if this shows up in profile
+ 	}
++    PERF_END(chain_ns);
++    libranger_plugin_stats_add(CHAIN, chain_ns);
+ 
+ 	if (mm_dbg_flag & MM_DBG_PRINT_SEED)
+ 		for (j = 0; j < n_regs0; ++j)
+@@ -331,6 +338,7 @@ void mm_map_frag(const mm_idx_t *mi, int n_segs, const int *qlens, const char **
+ 				fprintf(stderr, "CN\t%d\t%s\t%d\t%c\t%d\t%d\t%d\n", j, mi->seq[a[i].x<<1>>33].name, (int32_t)a[i].x, "+-"[a[i].x>>63], (int32_t)a[i].y, (int32_t)(a[i].y>>32&0xff),
+ 						i == regs0[j].as? 0 : ((int32_t)a[i].y - (int32_t)a[i-1].y) - ((int32_t)a[i].x - (int32_t)a[i-1].x));
+ 
++	PERF_START(post_ns);
+ 	chain_post(opt, max_chain_gap_ref, mi, b->km, qlen_sum, n_segs, qlens, &n_regs0, regs0, a);
+ 	if (!is_sr && !(opt->flag&MM_F_QSTRAND))
+ 		mm_est_err(mi, qlen_sum, n_regs0, regs0, a, n_mini_pos, mini_pos);
+@@ -353,6 +361,8 @@ void mm_map_frag(const mm_idx_t *mi, int n_segs, const int *qlens, const char **
+ 		if (n_segs == 2 && opt->pe_ori >= 0 && (opt->flag&MM_F_CIGAR))
+ 			mm_pair(b->km, max_chain_gap_ref, opt->pe_bonus, opt->a * 2 + opt->b, opt->a, qlens, n_regs, regs); // pairing
+ 	}
++    PERF_END(post_ns);
++    libranger_plugin_stats_add(POST, post_ns);
+ 
+ 	kfree(b->km, mv.a);
+ 	kfree(b->km, a);
+diff --git a/minimap.h b/minimap.h
+index 2204b6c..f773595 100644
+--- a/minimap.h
++++ b/minimap.h
+@@ -43,6 +43,7 @@
+ #define MM_I_HPC          0x1
+ #define MM_I_NO_SEQ       0x2
+ #define MM_I_NO_NAME      0x4
++#define MM_I_USENMPLUGIN  0x8
+ 
+ #define MM_IDX_MAGIC   "MMI\2"
+ 
+@@ -68,6 +69,13 @@ extern "C" {
+ typedef struct { uint64_t x, y; } mm128_t;
+ typedef struct { size_t n, m; mm128_t *a; } mm128_v;
+ 
++// Index size
++typedef struct {
++    uint64_t index;
++    uint64_t poslist;
++    uint64_t ref;
++} mm_idx_size_t;
++
+ // minimap2 index
+ typedef struct {
+ 	char *name;      // name of the db sequence
+diff --git a/mmpriv.h b/mmpriv.h
+index a2b5a80..47e5965 100644
+--- a/mmpriv.h
++++ b/mmpriv.h
+@@ -73,6 +73,10 @@ void mm_write_sam3(kstring_t *s, const mm_idx_t *mi, const mm_bseq1_t *t, int se
+ 
+ void mm_idxopt_init(mm_idxopt_t *opt);
+ const uint64_t *mm_idx_get(const mm_idx_t *mi, uint64_t minier, int *n);
++void mm_idx_get_batch(const mm_idx_t *mi, uint64_t *m, int *n, const uint64_t **v);
++mm_idx_size_t mm_idx_calc_size_bytes(const mm_idx_t *mi);
++void mm_idx_compare(const mm_idx_t *base, const mm_idx_t *mi);
++int mm_idx_uses_libranger(const void *mi);
+ int32_t mm_idx_cal_max_occ(const mm_idx_t *mi, float f);
+ int mm_idx_getseq2(const mm_idx_t *mi, int is_rev, uint32_t rid, uint32_t st, uint32_t en, uint8_t *seq);
+ mm_reg1_t *mm_align_skeleton(void *km, const mm_mapopt_t *opt, const mm_idx_t *mi, int qlen, const char *qstr, int *n_regs_, mm_reg1_t *regs, mm128_t *a);
+diff --git a/seed.c b/seed.c
+index 08fe5ad..6c521d3 100644
+--- a/seed.c
++++ b/seed.c
+@@ -1,6 +1,7 @@
+ #include "mmpriv.h"
+ #include "kalloc.h"
+ #include "ksort.h"
++#include "libranger_plugin_mm.h"
+ 
+ void mm_seed_mz_flt(void *km, mm128_v *mv, int32_t q_occ_max, float q_occ_frac)
+ {
+@@ -27,25 +28,47 @@ void mm_seed_mz_flt(void *km, mm128_v *mv, int32_t q_occ_max, float q_occ_frac)
+ 	mv->n = j;
+ }
+ 
++static inline void
++mm_seed_do_elemenet(mm_seed_t *m, int *k, const mm128_v *mv, const mm_idx_t *mi,
++                    int i, const uint64_t *cr, mm128_t *p, int t)
++{
++    mm_seed_t *q;
++    uint32_t q_pos = (uint32_t)p->y, q_span = p->x & 0xff;
++    // cr = mm_idx_get(mi, p->x>>8, &t);
++    if (t == 0) return;
++    q = &m[(*k)++];
++    q->q_pos = q_pos, q->q_span = q_span, q->cr = cr, q->n = t, q->seg_id = p->y >> 32;
++    q->is_tandem = q->flt = 0;
++    if (i > 0 && p->x>>8 == mv->a[i - 1].x>>8) q->is_tandem = 1;
++    if (i < mv->n - 1 && p->x>>8 == mv->a[i + 1].x>>8) q->is_tandem = 1;
++}
++
+ mm_seed_t *mm_seed_collect_all(void *km, const mm_idx_t *mi, const mm128_v *mv, int32_t *n_m_)
+ {
+ 	mm_seed_t *m;
+-	size_t i;
++	long i;
+ 	int32_t k;
+-	m = (mm_seed_t*)kmalloc(km, mv->n * sizeof(mm_seed_t));
+-	for (i = k = 0; i < mv->n; ++i) {
+-		const uint64_t *cr;
+-		mm_seed_t *q;
+-		mm128_t *p = &mv->a[i];
+-		uint32_t q_pos = (uint32_t)p->y, q_span = p->x & 0xff;
+-		int t;
+-		cr = mm_idx_get(mi, p->x>>8, &t);
+-		if (t == 0) continue;
+-		q = &m[k++];
+-		q->q_pos = q_pos, q->q_span = q_span, q->cr = cr, q->n = t, q->seg_id = p->y >> 32;
+-		q->is_tandem = q->flt = 0;
+-		if (i > 0 && p->x>>8 == mv->a[i - 1].x>>8) q->is_tandem = 1;
+-		if (i < mv->n - 1 && p->x>>8 == mv->a[i + 1].x>>8) q->is_tandem = 1;
++
++	const uint64_t *cr_arr[LIBRANGER_BATCH_SIZE];
++	mm128_t *p_arr[LIBRANGER_BATCH_SIZE];
++	uint64_t m_arr[LIBRANGER_BATCH_SIZE];
++    int t_arr[LIBRANGER_BATCH_SIZE];
++    long size = (long)mv->n;
++
++	m = (mm_seed_t*)kmalloc(km, size * sizeof(mm_seed_t));
++	for (i = k = 0; i < size; i+=LIBRANGER_BATCH_SIZE) {
++	    /* Prepare batch */
++	    for (int j=0; j<LIBRANGER_BATCH_SIZE && i+j < size; j++) {
++	        p_arr[j] = &mv->a[i+j];
++	        m_arr[j] = p_arr[j]->x>>8;
++	    }
++	    /* Lookup on batches */
++	    mm_idx_get_batch(mi, m_arr, t_arr, cr_arr);
++	    /* Do work on elements */
++	    for (int j=0; j<LIBRANGER_BATCH_SIZE && i+j < size; j++) {
++	        mm_seed_do_elemenet(m, &k, mv, mi, i+j,
++	                            cr_arr[j], p_arr[j], t_arr[j]);
++	    }
+ 	}
+ 	*n_m_ = k;
+ 	return m;

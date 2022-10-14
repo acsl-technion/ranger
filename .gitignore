@@ -1,0 +1,5 @@
+bin/*
+.gdb_history
+libnmu/*
+minimap2
+
